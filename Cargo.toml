@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
+  "bdk-wallet",
   "bitcoin-test-utils",
   "bitcoin-rpc-provider",
   "p2pd-oracle-client",

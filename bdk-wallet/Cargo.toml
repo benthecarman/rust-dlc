@@ -1,0 +1,10 @@
+[package]
+authors = ["Crypto Garage"]
+name = "bdk-wallet"
+version = "0.1.0"
+
+[dependencies]
+bitcoin = {version = "0.29.2" }
+bdk = "0.24.0"
+dlc-manager = {version = "0.3.0", path = "../dlc-manager"}
+rust-bitcoin-coin-selection = {version = "0.1.0", git = "https://github.com/p2pderivatives/rust-bitcoin-coin-selection", features = ["rand"]}
