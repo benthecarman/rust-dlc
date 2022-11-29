@@ -1655,7 +1655,13 @@ where
         //todo(tibo): check and deal with reorgs.
 
         for height in last_height + 1..cur_height {
-            let block = self.blockchain.get_block_at_height(height)?;
+            let block_opt = self.blockchain.get_block_at_height(height)?;
+
+            if !block_opt.is_some() {
+                continue;
+            }
+
+            let block = block_opt.unwrap();
 
             let watch_res = self.chain_monitor.process_block(&block, height);
 

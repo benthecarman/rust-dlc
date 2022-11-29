@@ -118,7 +118,7 @@ pub trait Blockchain {
     /// Returns the height of the blockchain
     fn get_blockchain_height(&self) -> Result<u64, Error>;
     /// Returns the block at given height
-    fn get_block_at_height(&self, height: u64) -> Result<Block, Error>;
+    fn get_block_at_height(&self, height: u64) -> Result<Option<Block>, Error>;
 }
 
 /// Storage trait provides functionalities to store and retrieve DLCs.
