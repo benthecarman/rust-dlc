@@ -541,7 +541,7 @@ fn insert_contract(
     db.insert(&contract.get_id(), serialized)
 }
 
-fn serialize_contract(contract: &Contract) -> Result<Vec<u8>, ::std::io::Error> {
+fn serialize_contract(contract: &Contract) -> Result<Vec<u8>, ::lightning::io::Error> {
     let serialized = match contract {
         Contract::Offered(o) | Contract::Rejected(o) => o.serialize(),
         Contract::Accepted(o) => o.serialize(),
@@ -598,7 +598,7 @@ fn deserialize_contract(buff: &sled::IVec) -> Result<Contract, Error> {
     Ok(contract)
 }
 
-fn serialize_channel(channel: &Channel) -> Result<Vec<u8>, ::std::io::Error> {
+fn serialize_channel(channel: &Channel) -> Result<Vec<u8>, ::lightning::io::Error> {
     let serialized = match channel {
         Channel::Offered(o) => o.serialize(),
         Channel::Accepted(a) => a.serialize(),

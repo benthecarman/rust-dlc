@@ -1,6 +1,13 @@
 //! Module for working with DLC channels
 
+#[cfg(feature = "no-std")]
+extern crate hashbrown;
+
+#[cfg(not(feature = "no-std"))]
 use std::collections::HashMap;
+
+#[cfg(feature = "no-std")]
+use self::hashbrown::HashMap;
 
 use crate::{signatures_to_secret, util::get_sig_hash_msg, DlcTransactions, PartyParams, Payout};
 
@@ -14,6 +21,7 @@ use secp256k1_zkp::{
     schnorr::Signature as SchnorrSignature, EcdsaAdaptorSignature, PublicKey as SecpPublicKey,
     Secp256k1, SecretKey, Signing, Verification,
 };
+use std::iter::FromIterator;
 
 /**
  * Weight of the buffer transaction:
@@ -357,7 +365,7 @@ pub fn sign_cet<C: Signing>(
     )?;
     let own_pk = SecpPublicKey::from_secret_key(secp, own_sk);
 
-    let sigs = HashMap::from([
+    let sigs = HashMap::from_iter([
         (
             PublicKey {
                 inner: own_pk,

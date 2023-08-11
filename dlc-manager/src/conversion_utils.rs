@@ -29,7 +29,6 @@ use dlc_messages::{
     oracle_msgs::EventDescriptor,
 };
 use dlc_trie::OracleNumericInfo;
-use std::error;
 use std::fmt;
 
 pub(crate) const BITCOIN_CHAINHASH: [u8; 32] = [
@@ -54,8 +53,9 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error {
-    fn cause(&self) -> Option<&dyn error::Error> {
+#[cfg(not(feature = "no-std"))]
+impl std::error::Error for Error {
+    fn cause(&self) -> Option<&dyn std::error::Error> {
         match *self {
             Error::BitcoinEncoding(ref e) => Some(e),
             Error::InvalidParameters => None,
