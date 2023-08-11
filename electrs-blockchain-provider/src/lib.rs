@@ -20,6 +20,7 @@ const MIN_FEERATE: u32 = 253;
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub enum Target {
+    Minimum = 1008,
     Background = 144,
     Normal = 18,
     HighPriority = 6,
@@ -202,6 +203,11 @@ impl simple_wallet::WalletBlockchainProvider for ElectrsBlockchainProvider {
 impl FeeEstimator for ElectrsBlockchainProvider {
     fn get_est_sat_per_1000_weight(&self, confirmation_target: ConfirmationTarget) -> u32 {
         let est = match confirmation_target {
+            ConfirmationTarget::MempoolMinimum => self
+                .fees
+                .get(&Target::Minimum)
+                .unwrap()
+                .load(Ordering::Acquire),
             ConfirmationTarget::Background => self
                 .fees
                 .get(&Target::Background)
@@ -304,21 +310,23 @@ impl BlockSource for ElectrsBlockchainProvider {
 }
 
 impl BroadcasterInterface for ElectrsBlockchainProvider {
-    fn broadcast_transaction(&self, tx: &Transaction) {
-        let client = self.client.clone();
-        let host = self.host.clone();
-        let body = bitcoin_test_utils::tx_to_string(tx);
-        std::thread::spawn(move || {
-            match client.post(format!("{host}tx")).body(body).send() {
-                Err(_) => {}
-                Ok(res) => {
-                    if res.error_for_status_ref().is_err() {
-                        // let body = res.text().unwrap_or_default();
-                        // TODO(tibo): log
+    fn broadcast_transactions(&self, txs: &[&Transaction]) {
+        for tx in txs {
+            let client = self.client.clone();
+            let host = self.host.clone();
+            let body = bitcoin_test_utils::tx_to_string(tx);
+            std::thread::spawn(move || {
+                match client.post(format!("{host}tx")).body(body).send() {
+                    Err(_) => {}
+                    Ok(res) => {
+                        if res.error_for_status_ref().is_err() {
+                            // let body = res.text().unwrap_or_default();
+                            // TODO(tibo): log
+                        }
                     }
-                }
-            };
-        });
+                };
+            });
+        }
     }
 }
 
