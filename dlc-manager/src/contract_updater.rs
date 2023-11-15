@@ -2,6 +2,7 @@
 
 use std::ops::Deref;
 
+use bitcoin::psbt::PartiallySignedTransaction;
 use bitcoin::{consensus::Decodable, Script, Transaction, Witness};
 use dlc::{DlcTransactions, PartyParams};
 use dlc_messages::{
@@ -310,6 +311,7 @@ where
     } = dlc_transactions;
 
     let mut fund = fund.clone();
+    let mut fund_psbt = PartiallySignedTransaction::from_unsigned_tx(fund.clone()).unwrap();
     let mut cets = cets.clone();
 
     let input_script_pubkey = input_script_pubkey.unwrap_or_else(|| funding_script_pubkey.clone());
@@ -392,43 +394,63 @@ where
         own_signatures.extend(sigs);
     }
 
-    let mut input_serial_ids: Vec<_> = offered_contract
+    // get all funding inputs
+    let mut all_funding_inputs = offered_contract
         .funding_inputs_info
         .iter()
-        .map(|x| x.funding_input.input_serial_id)
-        .chain(accept_params.inputs.iter().map(|x| x.serial_id))
-        .collect();
-    input_serial_ids.sort_unstable();
+        .chain(funding_inputs_info.iter())
+        .collect::<Vec<_>>();
+    // sort by serial id
+    all_funding_inputs.sort_by_key(|x| x.funding_input.input_serial_id);
+
+    // add witness utxo to fund_psbt for all inputs
+    for (input_index, x) in all_funding_inputs.iter().enumerate() {
+        let tx = Transaction::consensus_decode(&mut x.funding_input.prev_tx.as_slice()).map_err(
+            |_| {
+                Error::InvalidParameters(
+                    "Could not decode funding input previous tx parameter".to_string(),
+                )
+            },
+        )?;
+        let vout = x.funding_input.prev_tx_vout;
+        let tx_out = tx.output.get(vout as usize).ok_or_else(|| {
+            Error::InvalidParameters(format!("Previous tx output not found at index {}", vout))
+        })?;
+
+        fund_psbt.inputs[input_index].witness_utxo = Some(tx_out.clone());
+        fund_psbt.inputs[input_index].redeem_script = Some(x.funding_input.redeem_script.clone());
+    }
 
     // Vec<Witness>
     let witnesses: Vec<Witness> = offered_contract
         .funding_inputs_info
         .iter()
         .map(|x| {
-            let input_index = input_serial_ids
+            let input_index = all_funding_inputs
                 .iter()
-                .position(|y| y == &x.funding_input.input_serial_id)
+                .position(|y| y.funding_input == x.funding_input)
                 .ok_or_else(|| {
                     Error::InvalidState(format!(
                         "Could not find input for serial id {}",
                         x.funding_input.input_serial_id
                     ))
                 })?;
-            let tx = Transaction::consensus_decode(&mut x.funding_input.prev_tx.as_slice())
-                .map_err(|_| {
-                    Error::InvalidParameters(
-                        "Could not decode funding input previous tx parameter".to_string(),
-                    )
-                })?;
-            let vout = x.funding_input.prev_tx_vout;
-            let tx_out = tx.output.get(vout as usize).ok_or_else(|| {
-                Error::InvalidParameters(format!("Previous tx output not found at index {}", vout))
-            })?;
 
-            // pass wallet instead of privkeys
-            signer.sign_tx_input(&mut fund, input_index, tx_out, None)?;
+            signer.sign_psbt_input(&mut fund_psbt, input_index)?;
 
-            Ok(fund.input[input_index].witness.clone())
+            fund.input[input_index].witness = fund_psbt.inputs[input_index]
+                .final_script_witness
+                .clone()
+                .unwrap();
+
+            let witness = fund_psbt.inputs[input_index]
+                .final_script_witness
+                .clone()
+                .ok_or(Error::InvalidParameters(
+                    "No witness from signing psbt input".to_string(),
+                ))?;
+
+            Ok(witness)
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
@@ -444,8 +466,6 @@ where
             Ok(FundingSignature { witness_elements })
         })
         .collect::<Result<Vec<_>, Error>>()?;
-
-    input_serial_ids.sort_unstable();
 
     let offer_refund_signature = dlc::util::get_raw_sig_for_tx_input(
         secp,
@@ -565,24 +585,44 @@ where
         )?;
     }
 
-    let mut input_serials: Vec<_> = offered_contract
+    let mut fund_tx = accepted_contract.dlc_transactions.fund.clone();
+    let mut fund_psbt = PartiallySignedTransaction::from_unsigned_tx(fund_tx.clone()).unwrap();
+
+    // get all funding inputs
+    let mut all_funding_inputs = offered_contract
         .funding_inputs_info
         .iter()
         .chain(accepted_contract.funding_inputs.iter())
-        .map(|x| x.funding_input.input_serial_id)
-        .collect();
-    input_serials.sort_unstable();
+        .collect::<Vec<_>>();
+    // sort by serial id
+    all_funding_inputs.sort_by_key(|x| x.funding_input.input_serial_id);
 
-    let mut fund_tx = accepted_contract.dlc_transactions.fund.clone();
+    // add witness utxo to fund_psbt for all inputs
+    for (input_index, x) in all_funding_inputs.iter().enumerate() {
+        let tx = Transaction::consensus_decode(&mut x.funding_input.prev_tx.as_slice()).map_err(
+            |_| {
+                Error::InvalidParameters(
+                    "Could not decode funding input previous tx parameter".to_string(),
+                )
+            },
+        )?;
+        let vout = x.funding_input.prev_tx_vout;
+        let tx_out = tx.output.get(vout as usize).ok_or_else(|| {
+            Error::InvalidParameters(format!("Previous tx output not found at index {}", vout))
+        })?;
+
+        fund_psbt.inputs[input_index].witness_utxo = Some(tx_out.clone());
+        fund_psbt.inputs[input_index].redeem_script = Some(x.funding_input.redeem_script.clone());
+    }
 
     for (funding_input, funding_signatures) in offered_contract
         .funding_inputs_info
         .iter()
         .zip(funding_signatures.funding_signatures.iter())
     {
-        let input_index = input_serials
+        let input_index = all_funding_inputs
             .iter()
-            .position(|x| x == &funding_input.funding_input.input_serial_id)
+            .position(|x| x.funding_input == funding_input.funding_input)
             .ok_or_else(|| {
                 Error::InvalidState(format!(
                     "Could not find input for serial id {}",
@@ -599,29 +639,25 @@ where
         );
     }
 
-    for funding_input_info in &accepted_contract.funding_inputs {
-        let input_index = input_serials
+    for funding_input in &accepted_contract.funding_inputs {
+        let input_index = all_funding_inputs
             .iter()
-            .position(|x| x == &funding_input_info.funding_input.input_serial_id)
+            .position(|x| x.funding_input == funding_input.funding_input)
             .ok_or_else(|| {
                 Error::InvalidState(format!(
                     "Could not find input for serial id {}",
-                    funding_input_info.funding_input.input_serial_id,
+                    funding_input.funding_input.input_serial_id
                 ))
             })?;
-        let tx =
-            Transaction::consensus_decode(&mut funding_input_info.funding_input.prev_tx.as_slice())
-                .map_err(|_| {
-                    Error::InvalidParameters(
-                        "Could not decode funding input previous tx parameter".to_string(),
-                    )
-                })?;
-        let vout = funding_input_info.funding_input.prev_tx_vout;
-        let tx_out = tx.output.get(vout as usize).ok_or_else(|| {
-            Error::InvalidParameters(format!("Previous tx output not found at index {}", vout))
-        })?;
 
-        signer.sign_tx_input(&mut fund_tx, input_index, tx_out, None)?;
+        signer.sign_psbt_input(&mut fund_psbt, input_index)?;
+
+        fund_tx.input[input_index].witness = fund_psbt.inputs[input_index]
+            .final_script_witness
+            .clone()
+            .ok_or(Error::InvalidParameters(
+                "No witness from signing psbt input".to_string(),
+            ))?;
     }
 
     let signed_contract = SignedContract {
