@@ -592,6 +592,66 @@ where
         Ok(())
     }
 
+    /// Manually close a contract with the oracle attestations.
+    pub fn close_confirmed_contract(
+        &mut self,
+        contract_id: &ContractId,
+        attestations: Vec<(usize, OracleAttestation)>,
+    ) -> Result<Contract, Error> {
+        if let Some(Contract::Confirmed(contract)) = self.store.get_contract(contract_id)? {
+            let contract_infos = &contract.accepted_contract.offered_contract.contract_info;
+            let adaptor_infos = &contract.accepted_contract.adaptor_infos;
+
+            // find the contract info that matches the attestations
+            if let Some((contract_info, adaptor_info)) =
+                contract_infos.iter().zip(adaptor_infos).find(|(c, _)| {
+                    // todo this is probably wrong
+                    c.threshold <= attestations.len()
+                        && c.oracle_announcements
+                            .iter()
+                            .zip(attestations.iter())
+                            .all(|(o, a)| o.oracle_public_key == a.1.oracle_public_key)
+                })
+            {
+                let cet = crate::contract_updater::get_signed_cet(
+                    &self.secp,
+                    &contract,
+                    contract_info,
+                    adaptor_info,
+                    &attestations,
+                    &self.wallet,
+                )?;
+
+                match self.close_contract(
+                    &contract,
+                    cet,
+                    attestations.into_iter().map(|x| x.1).collect(),
+                ) {
+                    Ok(closed_contract) => {
+                        self.store.update_contract(&closed_contract)?;
+                        return Ok(closed_contract);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to close contract {}: {}",
+                            contract.accepted_contract.get_contract_id_string(),
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
+            } else {
+                return Err(Error::InvalidState(
+                    "Attestations did not match contract infos".to_string(),
+                ));
+            }
+        }
+
+        Err(Error::InvalidState(
+            "Contract is not in confirmed state".to_string(),
+        ))
+    }
+
     fn check_preclosed_contracts(&mut self) -> Result<(), Error> {
         for c in self.store.get_preclosed_contracts()? {
             if let Err(e) = self.check_preclosed_contract(&c) {
