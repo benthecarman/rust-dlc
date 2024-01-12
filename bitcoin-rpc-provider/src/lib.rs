@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitcoin::consensus::encode::Error as EncodeError;
+use bitcoin::hashes::{sha256, Hash, HashEngine, Hmac, HmacEngine};
 use bitcoin::psbt::PartiallySignedTransaction;
 use bitcoin::secp256k1::rand::thread_rng;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
@@ -18,7 +19,7 @@ use bitcoin::{Address, OutPoint, TxOut};
 use bitcoincore_rpc::{json, Auth, Client, RpcApi};
 use bitcoincore_rpc_json::AddressType;
 use dlc_manager::error::Error as ManagerError;
-use dlc_manager::{Blockchain, Signer, Utxo, Wallet};
+use dlc_manager::{Blockchain, ContractSignerProvider, SimpleSigner, Utxo, Wallet};
 use json::EstimateMode;
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use log::error;
@@ -102,7 +103,7 @@ impl BitcoinCoreProvider {
 
     pub fn new_from_rpc_client(rpc_client: Client) -> Self {
         let client = Arc::new(Mutex::new(rpc_client));
-        let mut fees: HashMap<ConfirmationTarget, AtomicU32> = HashMap::new();
+        let mut fees: HashMap<ConfirmationTarget, AtomicU32> = HashMap::with_capacity(7);
         fees.insert(ConfirmationTarget::OnChainSweep, AtomicU32::new(5000));
         fees.insert(
             ConfirmationTarget::MaxAllowedNonAnchorChannelRemoteFee,
@@ -168,7 +169,46 @@ fn enc_err_to_manager_err(_e: EncodeError) -> ManagerError {
     Error::BitcoinError.into()
 }
 
-impl Signer for BitcoinCoreProvider {
+impl ContractSignerProvider for BitcoinCoreProvider {
+    type Signer = SimpleSigner;
+
+    fn derive_signer_key_id(&self, _is_offer_party: bool, temp_id: [u8; 32]) -> [u8; 32] {
+        temp_id // fixme not safe
+    }
+
+    fn derive_contract_signer(&self, keys_id: [u8; 32]) -> Result<Self::Signer, ManagerError> {
+        // todo not a safe way to get the seed, not sure what to do here
+        let wallet_info = self
+            .client
+            .lock()
+            .unwrap()
+            .get_wallet_info()
+            .map_err(rpc_err_to_manager_err)?;
+        let seed = wallet_info.hd_seed_id.unwrap().to_vec();
+        let mut hmac = HmacEngine::<sha256::Hash>::new(&seed);
+        hmac.input(&keys_id);
+        let secret_bytes = Hmac::from_engine(hmac).into_inner();
+        let secret_key = SecretKey::from_slice(&secret_bytes).expect("Secret key is valid");
+
+        // import key
+        let network = self.get_network()?;
+        self.client
+            .lock()
+            .unwrap()
+            .import_private_key(
+                &PrivateKey {
+                    compressed: true,
+                    network,
+                    inner: secret_key,
+                },
+                None,
+                Some(false),
+            )
+            .map_err(rpc_err_to_manager_err)?;
+
+        Ok(SimpleSigner::new(secret_key))
+    }
+
     fn get_secret_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<SecretKey, ManagerError> {
         let b_pubkey = bitcoin::PublicKey {
             compressed: true,
@@ -182,8 +222,96 @@ impl Signer for BitcoinCoreProvider {
             .lock()
             .unwrap()
             .dump_private_key(&address)
+            .map_err(|e| {
+                eprintln!("error getting sk for pk {e:?}");
+                e
+            })
             .map_err(rpc_err_to_manager_err)?;
         Ok(pk.inner)
+    }
+
+    fn get_new_secret_key(&self) -> Result<SecretKey, ManagerError> {
+        let sk = SecretKey::new(&mut thread_rng());
+        let network = self.get_network()?;
+        self.client
+            .lock()
+            .unwrap()
+            .import_private_key(
+                &PrivateKey {
+                    compressed: true,
+                    network,
+                    inner: sk,
+                },
+                None,
+                Some(false),
+            )
+            .map_err(rpc_err_to_manager_err)?;
+
+        Ok(sk)
+    }
+}
+
+impl Wallet for BitcoinCoreProvider {
+    fn get_new_address(&self) -> Result<Address, ManagerError> {
+        self.client
+            .lock()
+            .unwrap()
+            .get_new_address(None, Some(AddressType::Bech32))
+            .map_err(rpc_err_to_manager_err)
+    }
+
+    fn get_new_change_address(&self) -> Result<Address, ManagerError> {
+        self.get_new_address()
+    }
+
+    fn get_utxos_for_amount(
+        &self,
+        amount: u64,
+        _fee_rate: u64,
+        lock_utxos: bool,
+    ) -> Result<Vec<Utxo>, ManagerError> {
+        let client = self.client.lock().unwrap();
+        let utxo_res = client
+            .list_unspent(None, None, None, Some(false), None)
+            .map_err(rpc_err_to_manager_err)?;
+        let mut utxo_pool: Vec<UtxoWrap> = utxo_res
+            .iter()
+            .filter(|x| x.spendable)
+            .map(|x| {
+                Ok(UtxoWrap(Utxo {
+                    tx_out: TxOut {
+                        value: x.amount.to_sat(),
+                        script_pubkey: x.script_pub_key.clone(),
+                    },
+                    outpoint: OutPoint {
+                        txid: x.txid,
+                        vout: x.vout,
+                    },
+                    address: x.address.as_ref().ok_or(Error::InvalidState)?.clone(),
+                    redeem_script: x.redeem_script.as_ref().unwrap_or(&Script::new()).clone(),
+                    reserved: false,
+                }))
+            })
+            .collect::<Result<Vec<UtxoWrap>, Error>>()?;
+        // TODO(tibo): properly compute the cost of change
+        let selection = select_coins(amount, 20, &mut utxo_pool).ok_or(Error::NotEnoughCoins)?;
+
+        if lock_utxos {
+            let outputs: Vec<_> = selection.iter().map(|x| x.0.outpoint).collect();
+            client
+                .lock_unspent(&outputs)
+                .map_err(rpc_err_to_manager_err)?;
+        }
+
+        Ok(selection.into_iter().map(|x| x.0).collect())
+    }
+
+    fn import_address(&self, address: &Address) -> Result<(), ManagerError> {
+        self.client
+            .lock()
+            .unwrap()
+            .import_address(address, None, Some(false))
+            .map_err(rpc_err_to_manager_err)
     }
 
     fn sign_psbt_input(
@@ -236,90 +364,6 @@ impl Signer for BitcoinCoreProvider {
             Some(signed_tx.input[input_index].witness.clone());
 
         Ok(())
-    }
-}
-
-impl Wallet for BitcoinCoreProvider {
-    fn get_new_address(&self) -> Result<Address, ManagerError> {
-        self.client
-            .lock()
-            .unwrap()
-            .get_new_address(None, Some(AddressType::Bech32))
-            .map_err(rpc_err_to_manager_err)
-    }
-
-    fn get_new_change_address(&self) -> Result<Address, ManagerError> {
-        self.get_new_address()
-    }
-
-    fn get_new_secret_key(&self) -> Result<SecretKey, ManagerError> {
-        let sk = SecretKey::new(&mut thread_rng());
-        let network = self.get_network()?;
-        self.client
-            .lock()
-            .unwrap()
-            .import_private_key(
-                &PrivateKey {
-                    compressed: true,
-                    network,
-                    inner: sk,
-                },
-                None,
-                Some(false),
-            )
-            .map_err(rpc_err_to_manager_err)?;
-
-        Ok(sk)
-    }
-
-    fn get_utxos_for_amount(
-        &self,
-        amount: u64,
-        _fee_rate: u64,
-        lock_utxos: bool,
-    ) -> Result<Vec<Utxo>, ManagerError> {
-        let client = self.client.lock().unwrap();
-        let utxo_res = client
-            .list_unspent(None, None, None, Some(false), None)
-            .map_err(rpc_err_to_manager_err)?;
-        let mut utxo_pool: Vec<UtxoWrap> = utxo_res
-            .iter()
-            .filter(|x| x.spendable)
-            .map(|x| {
-                Ok(UtxoWrap(Utxo {
-                    tx_out: TxOut {
-                        value: x.amount.to_sat(),
-                        script_pubkey: x.script_pub_key.clone(),
-                    },
-                    outpoint: OutPoint {
-                        txid: x.txid,
-                        vout: x.vout,
-                    },
-                    address: x.address.as_ref().ok_or(Error::InvalidState)?.clone(),
-                    redeem_script: x.redeem_script.as_ref().unwrap_or(&Script::new()).clone(),
-                    reserved: false,
-                }))
-            })
-            .collect::<Result<Vec<UtxoWrap>, Error>>()?;
-        // TODO(tibo): properly compute the cost of change
-        let selection = select_coins(amount, 20, &mut utxo_pool).ok_or(Error::NotEnoughCoins)?;
-
-        if lock_utxos {
-            let outputs: Vec<_> = selection.iter().map(|x| x.0.outpoint).collect();
-            client
-                .lock_unspent(&outputs)
-                .map_err(rpc_err_to_manager_err)?;
-        }
-
-        Ok(selection.into_iter().map(|x| x.0).collect())
-    }
-
-    fn import_address(&self, address: &Address) -> Result<(), ManagerError> {
-        self.client
-            .lock()
-            .unwrap()
-            .import_address(address, None, Some(false))
-            .map_err(rpc_err_to_manager_err)
     }
 }
 

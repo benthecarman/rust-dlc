@@ -5,12 +5,16 @@ use bdk::{
     wallet::coin_selection::{BranchAndBoundCoinSelection, CoinSelectionAlgorithm},
     FeeRate, KeychainKind, LocalUtxo, Utxo as BdkUtxo, WeightedUtxo,
 };
+use bitcoin::hashes::sha256::Hash as Sha256;
+use bitcoin::hashes::{HashEngine, Hmac, HmacEngine};
 use bitcoin::psbt::PartiallySignedTransaction;
 use bitcoin::{
     hashes::Hash, Address, Network, PackedLockTime, Script, Sequence, Transaction, TxIn, TxOut,
     Txid, Witness,
 };
-use dlc_manager::{error::Error, Blockchain, Signer, Utxo, Wallet};
+use dlc_manager::{
+    error::Error, Blockchain, ContractSignerProvider, KeysId, SimpleSigner, Utxo, Wallet,
+};
 use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use secp256k1_zkp::{rand::thread_rng, All, PublicKey, Secp256k1, SecretKey};
 
@@ -47,6 +51,7 @@ where
     storage: W,
     secp_ctx: Secp256k1<All>,
     network: Network,
+    seed: [u8; 32],
 }
 
 impl<B: Deref, W: Deref> SimpleWallet<B, W>
@@ -55,12 +60,13 @@ where
     W::Target: WalletStorage,
 {
     /// Create a new wallet instance.
-    pub fn new(blockchain: B, storage: W, network: Network) -> Self {
+    pub fn new(blockchain: B, storage: W, network: Network, seed: [u8; 32]) -> Self {
         Self {
             blockchain,
             storage,
             secp_ctx: Secp256k1::new(),
             network,
+            seed,
         }
     }
 
@@ -171,55 +177,32 @@ where
     }
 }
 
-impl<B: Deref, W: Deref> Signer for SimpleWallet<B, W>
+/// Computes the secret key from the temporary id and the seed.
+pub(crate) fn compute_secret_key(seed: [u8; 32], keys_id: [u8; 32]) -> SecretKey {
+    let mut hmac = HmacEngine::<Sha256>::new(&seed);
+    hmac.input(&keys_id);
+    let secret_bytes = Hmac::from_engine(hmac).into_inner();
+    SecretKey::from_slice(&secret_bytes).expect("Secret key is valid")
+}
+
+impl<B: Deref, W: Deref> ContractSignerProvider for SimpleWallet<B, W>
 where
     B::Target: WalletBlockchainProvider,
     W::Target: WalletStorage,
 {
-    fn sign_psbt_input(
-        &self,
-        psbt: &mut PartiallySignedTransaction,
-        input_index: usize,
-    ) -> std::result::Result<(), Error> {
-        let tx_out = if let Some(input) = psbt.inputs.get(input_index) {
-            if let Some(wit_utxo) = &input.witness_utxo {
-                Ok(wit_utxo.clone())
-            } else if let Some(in_tx) = &input.non_witness_utxo {
-                Ok(
-                    in_tx.output[psbt.unsigned_tx.input[input_index].previous_output.vout as usize]
-                        .clone(),
-                )
-            } else {
-                Err(Error::InvalidParameters(
-                    "No TxOut for PSBT inout".to_string(),
-                ))
-            }
-        } else {
-            Err(Error::InvalidParameters(
-                "No TxOut for PSBT inout".to_string(),
-            ))
-        }?;
-        let address = Address::from_script(&tx_out.script_pubkey, self.network)
-            .expect("a valid scriptpubkey");
-        let seckey = self
-            .storage
-            .get_priv_key_for_address(&address)?
-            .expect("to have the requested private key");
+    type Signer = SimpleSigner;
 
-        let mut tx = psbt.unsigned_tx.clone();
-        dlc::util::sign_p2wpkh_input(
-            &self.secp_ctx,
-            &seckey,
-            &mut tx,
-            input_index,
-            bitcoin::EcdsaSighashType::All,
-            tx_out.value,
-        )?;
+    fn derive_signer_key_id(&self, _is_offer_party: bool, temp_id: [u8; 32]) -> [u8; 32] {
+        // fixme: probably not the best
+        let secret_key = compute_secret_key(self.seed, temp_id);
+        secret_key.secret_bytes()
+    }
 
-        let tx_input = tx.input[input_index].clone();
-        psbt.inputs[input_index].final_script_sig = Some(tx_input.script_sig);
-        psbt.inputs[input_index].final_script_witness = Some(tx_input.witness);
-        Ok(())
+    fn derive_contract_signer(&self, keys_id: KeysId) -> Result<Self::Signer> {
+        let secret_key = compute_secret_key(self.seed, keys_id);
+        let pubkey = PublicKey::from_secret_key(&self.secp_ctx, &secret_key);
+        self.storage.upsert_key_pair(&pubkey, &secret_key)?;
+        Ok(SimpleSigner::new(secret_key))
     }
 
     fn get_secret_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<SecretKey> {
@@ -227,6 +210,13 @@ where
             .storage
             .get_priv_key_for_pubkey(pubkey)?
             .expect("to have the requested private key"))
+    }
+
+    fn get_new_secret_key(&self) -> Result<SecretKey> {
+        let seckey = SecretKey::new(&mut thread_rng());
+        let pubkey = PublicKey::from_secret_key(&self.secp_ctx, &seckey);
+        self.storage.upsert_key_pair(&pubkey, &seckey)?;
+        Ok(seckey)
     }
 }
 
@@ -252,13 +242,6 @@ where
 
     fn get_new_change_address(&self) -> Result<Address> {
         self.get_new_address()
-    }
-
-    fn get_new_secret_key(&self) -> Result<SecretKey> {
-        let seckey = SecretKey::new(&mut thread_rng());
-        let pubkey = PublicKey::from_secret_key(&self.secp_ctx, &seckey);
-        self.storage.upsert_key_pair(&pubkey, &seckey)?;
-        Ok(seckey)
     }
 
     fn get_utxos_for_amount(
@@ -316,6 +299,52 @@ where
     }
 
     fn import_address(&self, _: &Address) -> Result<()> {
+        Ok(())
+    }
+
+    fn sign_psbt_input(
+        &self,
+        psbt: &mut PartiallySignedTransaction,
+        input_index: usize,
+    ) -> std::result::Result<(), Error> {
+        let tx_out = if let Some(input) = psbt.inputs.get(input_index) {
+            if let Some(wit_utxo) = &input.witness_utxo {
+                Ok(wit_utxo.clone())
+            } else if let Some(in_tx) = &input.non_witness_utxo {
+                Ok(
+                    in_tx.output[psbt.unsigned_tx.input[input_index].previous_output.vout as usize]
+                        .clone(),
+                )
+            } else {
+                Err(Error::InvalidParameters(
+                    "No TxOut for PSBT inout".to_string(),
+                ))
+            }
+        } else {
+            Err(Error::InvalidParameters(
+                "No TxOut for PSBT inout".to_string(),
+            ))
+        }?;
+        let address = Address::from_script(&tx_out.script_pubkey, self.network)
+            .expect("a valid scriptpubkey");
+        let seckey = self
+            .storage
+            .get_priv_key_for_address(&address)?
+            .expect("to have the requested private key");
+
+        let mut tx = psbt.unsigned_tx.clone();
+        dlc::util::sign_p2wpkh_input(
+            &self.secp_ctx,
+            &seckey,
+            &mut tx,
+            input_index,
+            bitcoin::EcdsaSighashType::All,
+            tx_out.value,
+        )?;
+
+        let tx_input = tx.input[input_index].clone();
+        psbt.inputs[input_index].final_script_sig = Some(tx_input.script_sig);
+        psbt.inputs[input_index].final_script_witness = Some(tx_input.witness);
         Ok(())
     }
 }
@@ -492,7 +521,7 @@ where
 mod tests {
     use std::rc::Rc;
 
-    use dlc_manager::{Signer, Wallet};
+    use dlc_manager::ContractSignerProvider;
     use mocks::simple_wallet::SimpleWallet;
     use mocks::{memory_storage_provider::MemoryStorage, mock_blockchain::MockBlockchain};
     use secp256k1_zkp::{PublicKey, SECP256K1};
@@ -500,7 +529,7 @@ mod tests {
     fn get_wallet() -> SimpleWallet<Rc<MockBlockchain>, Rc<MemoryStorage>> {
         let blockchain = Rc::new(MockBlockchain::new());
         let storage = Rc::new(MemoryStorage::new());
-        SimpleWallet::new(blockchain, storage, bitcoin::Network::Regtest)
+        SimpleWallet::new(blockchain, storage, bitcoin::Network::Regtest, [0; 32])
     }
 
     #[test]

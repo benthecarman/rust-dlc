@@ -9,7 +9,7 @@ use dlc_manager::manager::Manager;
 use dlc_manager::{
     channel::{signed_channel::SignedChannelState, Channel},
     contract::Contract,
-    Blockchain, Oracle, Storage, Wallet,
+    Blockchain, CachedContractSignerProvider, Oracle, SimpleSigner, Storage, Wallet,
 };
 use dlc_manager::{ChannelId, ContractId};
 use dlc_messages::Message;
@@ -41,11 +41,18 @@ type DlcParty = Arc<
     Mutex<
         Manager<
             Arc<SimpleWallet<Arc<ElectrsBlockchainProvider>, Arc<MemoryStorage>>>,
+            Arc<
+                CachedContractSignerProvider<
+                    Arc<SimpleWallet<Arc<ElectrsBlockchainProvider>, Arc<MemoryStorage>>>,
+                    SimpleSigner,
+                >,
+            >,
             Arc<ElectrsBlockchainProvider>,
             Arc<MemoryStorage>,
             Arc<MockOracle>,
             Arc<MockTime>,
             Arc<ElectrsBlockchainProvider>,
+            SimpleSigner,
         >,
     >,
 >;
@@ -281,12 +288,14 @@ fn channel_execution_test(test_params: TestParams, path: TestPath) {
         electrs.clone(),
         alice_store.clone(),
         bitcoin::Network::Regtest,
+        [0; 32],
     ));
 
     let bob_wallet = Arc::new(SimpleWallet::new(
         electrs.clone(),
         bob_store.clone(),
         bitcoin::Network::Regtest,
+        [2; 32],
     ));
 
     let alice_fund_address = alice_wallet.get_new_address().unwrap();
@@ -342,6 +351,7 @@ fn channel_execution_test(test_params: TestParams, path: TestPath) {
     let alice_manager = Arc::new(Mutex::new(
         Manager::new(
             Arc::clone(&alice_wallet),
+            Arc::clone(&alice_wallet),
             Arc::clone(&electrs),
             alice_store,
             alice_oracles,
@@ -356,6 +366,7 @@ fn channel_execution_test(test_params: TestParams, path: TestPath) {
 
     let bob_manager = Arc::new(Mutex::new(
         Manager::new(
+            Arc::clone(&bob_wallet),
             Arc::clone(&bob_wallet),
             Arc::clone(&electrs),
             Arc::clone(&bob_store),

@@ -99,6 +99,11 @@ impl ContractInput {
         dlc::util::validate_fee_rate(self.fee_rate)
             .map_err(|_| Error::InvalidParameters("Fee rate too high.".to_string()))
     }
+
+    /// Returns the total collateral for the DLC.
+    pub fn total_collateral(&self) -> u64 {
+        self.offer_collateral + self.accept_collateral
+    }
 }
 
 #[cfg(test)]

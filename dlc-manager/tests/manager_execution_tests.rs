@@ -588,12 +588,14 @@ fn manager_execution_test(test_params: TestParams, path: TestPath, manual_close:
         electrs.clone(),
         alice_store.clone(),
         bitcoin::Network::Regtest,
+        [0; 32],
     ));
 
     let bob_wallet = Arc::new(SimpleWallet::new(
         electrs.clone(),
         bob_store.clone(),
         bitcoin::Network::Regtest,
+        [2; 32],
     ));
 
     let alice_fund_address = alice_wallet.get_new_address().unwrap();
@@ -649,6 +651,7 @@ fn manager_execution_test(test_params: TestParams, path: TestPath, manual_close:
     let alice_manager = Arc::new(Mutex::new(
         Manager::new(
             Arc::clone(&alice_wallet),
+            Arc::clone(&alice_wallet),
             Arc::clone(&electrs),
             alice_store,
             alice_oracles,
@@ -663,6 +666,7 @@ fn manager_execution_test(test_params: TestParams, path: TestPath, manual_close:
 
     let bob_manager = Arc::new(Mutex::new(
         Manager::new(
+            Arc::clone(&bob_wallet),
             Arc::clone(&bob_wallet),
             Arc::clone(&electrs),
             bob_store,
